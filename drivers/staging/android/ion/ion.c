@@ -47,6 +47,8 @@
 #include "ion_priv.h"
 #include "compat_ion.h"
 
+static struct kmem_cache *ion_sg_table_pool;
+
 bool ion_buffer_fault_user_mappings(struct ion_buffer *buffer)
 {
 	return (buffer->flags & ION_FLAG_CACHED) &&
@@ -1094,7 +1096,7 @@ static void ion_unmap_dma_buf(struct dma_buf_attachment *attachment,
 			      enum dma_data_direction direction)
 {
 	sg_free_table(table);
-	kfree(table);
+	kmem_cache_free(ion_sg_table_pool, table);
 }
 
 void ion_pages_sync_for_device(struct device *dev, struct page *page,
@@ -1995,6 +1997,12 @@ struct ion_device *ion_device_create(long (*custom_ioctl)
 	if (!idev)
 		return ERR_PTR(-ENOMEM);
 
+	ion_sg_table_pool = KMEM_CACHE(sg_table, SLAB_HWCACHE_ALIGN);
+	if (!ion_sg_table_pool) {
+		kfree(idev);
+		return ERR_PTR(-ENOMEM);
+	}
+
 	idev->dev.minor = MISC_DYNAMIC_MINOR;
 	idev->dev.name = "ion";
 	idev->dev.fops = &ion_fops;
@@ -2002,6 +2010,7 @@ struct ion_device *ion_device_create(long (*custom_ioctl)
 	ret = misc_register(&idev->dev);
 	if (ret) {
 		pr_err("ion: failed to register misc device.\n");
+		kmem_cache_destroy(ion_sg_table_pool);
 		kfree(idev);
 		return ERR_PTR(ret);
 	}
