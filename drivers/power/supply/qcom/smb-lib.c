@@ -3354,7 +3354,7 @@ int smblib_get_prop_die_health(struct smb_charger *chg,
 
 #define SDP_CURRENT_UA			500000
 #define CDP_CURRENT_UA			1500000
-#define DCP_CURRENT_UA			1800000
+#define DCP_CURRENT_UA			2200000
 #define HVDCP2_CURRENT_UA		1500000
 #define HVDCP3_CURRENT_UA		2750000
 #define TYPEC_DEFAULT_CURRENT_UA	900000
