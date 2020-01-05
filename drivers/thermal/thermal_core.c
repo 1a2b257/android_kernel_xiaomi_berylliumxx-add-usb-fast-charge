@@ -39,6 +39,8 @@
 #include <net/netlink.h>
 #include <net/genetlink.h>
 #include <linux/suspend.h>
+#include <linux/kobject.h>
+#include <../drivers/base/base.h>
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/thermal.h>
@@ -66,6 +68,8 @@ static LIST_HEAD(thermal_governor_list);
 
 static DEFINE_MUTEX(thermal_list_lock);
 static DEFINE_MUTEX(thermal_governor_lock);
+static DEFINE_MUTEX(cdev_softlink_lock);
+static DEFINE_MUTEX(tz_softlink_lock);
 
 static atomic_t in_suspend;
 
@@ -82,7 +86,7 @@ struct screen_monitor {
 struct screen_monitor sm;
 #endif
 
-static atomic_t switch_mode = ATOMIC_INIT(-1);
+static atomic_t switch_mode = ATOMIC_INIT(10);
 static atomic_t temp_state = ATOMIC_INIT(0);
 static char boost_buf[128];
 
@@ -419,11 +423,12 @@ static void thermal_zone_device_set_polling(struct workqueue_struct *queue,
 					    int delay)
 {
 	if (delay > 1000)
-		mod_delayed_work(queue, &tz->poll_queue,
+		mod_delayed_work(system_freezable_power_efficient_wq,
+				 &tz->poll_queue,
 				 round_jiffies(msecs_to_jiffies(delay)));
 	else if (delay)
-		mod_delayed_work(queue, &tz->poll_queue,
-				 msecs_to_jiffies(delay));
+		mod_delayed_work(system_freezable_power_efficient_wq,
+				 &tz->poll_queue, msecs_to_jiffies(delay));
 	else
 		cancel_delayed_work(&tz->poll_queue);
 }
@@ -629,7 +634,12 @@ static void update_temperature(struct thermal_zone_device *tz)
 static void thermal_zone_device_init(struct thermal_zone_device *tz)
 {
 	struct thermal_instance *pos;
-	tz->temperature = THERMAL_TEMP_INVALID;
+
+	if (tz->tzp && tz->tzp->tracks_low)
+		tz->temperature = THERMAL_TEMP_INVALID_LOW;
+	else
+		tz->temperature = THERMAL_TEMP_INVALID;
+
 	list_for_each_entry(pos, &tz->thermal_instances, tz_node)
 		pos->initialized = false;
 }
@@ -679,6 +689,13 @@ void thermal_zone_device_update(struct thermal_zone_device *tz,
 	thermal_zone_set_trips(tz);
 
 	tz->notify_event = event;
+	/*
+	 * To prevent cooling_device throttling
+	 * when tz->temperature keep initialized status.
+	 */
+	if (tz->temperature == THERMAL_TEMP_INVALID ||
+		tz->temperature == THERMAL_TEMP_INVALID_LOW)
+		return;
 
 	for (count = 0; count < tz->trips; count++)
 		handle_thermal_trip(tz, count);
@@ -1825,8 +1842,12 @@ __thermal_cooling_device_register(struct device_node *np,
 	struct thermal_cooling_device *cdev;
 	struct thermal_zone_device *pos = NULL;
 	int result;
+	static struct kobject *cdev_softlink_kobj;
 
 	if (type && strlen(type) >= THERMAL_NAME_LENGTH)
+		return ERR_PTR(-EINVAL);
+
+	if (!strcmp(type, ""))
 		return ERR_PTR(-EINVAL);
 
 	if (!ops || !ops->get_max_state || !ops->get_cur_state ||
@@ -1861,6 +1882,26 @@ __thermal_cooling_device_register(struct device_node *np,
 		kfree(cdev);
 		return ERR_PTR(result);
 	}
+
+	mutex_lock(&cdev_softlink_lock);
+	if (cdev_softlink_kobj == NULL) {
+		cdev_softlink_kobj = kobject_create_and_add("cdev-by-name",
+						cdev->device.kobj.parent);
+		result = sysfs_create_link(&cdev->device.class->p->subsys.kobj,
+							cdev_softlink_kobj,
+							"cdev-by-name");
+		if (result) {
+			dev_err(&cdev->device,
+				"Fail to create cdev_map "
+				"soft link in class\n");
+		}
+	}
+	mutex_unlock(&cdev_softlink_lock);
+
+	result = sysfs_create_link(cdev_softlink_kobj,
+				&cdev->device.kobj, cdev->type);
+	if (result)
+		dev_err(&cdev->device, "Fail to create cdev_map soft link\n");
 
 	/* Add 'this' new cdev to the global cdev list */
 	mutex_lock(&thermal_list_lock);
@@ -2189,8 +2230,12 @@ struct thermal_zone_device *thermal_zone_device_register(const char *type,
 	int count;
 	int passive = 0;
 	struct thermal_governor *governor;
+	static struct kobject *tz_softlink_kobj;
 
 	if (type && strlen(type) >= THERMAL_NAME_LENGTH)
+		return ERR_PTR(-EINVAL);
+
+	if (!strcmp(type, ""))
 		return ERR_PTR(-EINVAL);
 
 	if (trips > THERMAL_MAX_TRIPS || trips < 0 || mask >> trips)
@@ -2336,6 +2381,26 @@ struct thermal_zone_device *thermal_zone_device_register(const char *type,
 	/* Update the new thermal zone and mark it as already updated. */
 	if (atomic_cmpxchg(&tz->need_update, 1, 0))
 		thermal_zone_device_update(tz, THERMAL_EVENT_UNSPECIFIED);
+
+	/* Create softlink now */
+	mutex_lock(&tz_softlink_lock);
+	if (tz_softlink_kobj == NULL) {
+		tz_softlink_kobj = kobject_create_and_add("tz-by-name",
+						tz->device.kobj.parent);
+		result = sysfs_create_link(&tz->device.class->p->subsys.kobj,
+							tz_softlink_kobj,
+							"tz-by-name");
+		if (result) {
+			dev_err(&tz->device,
+				"Fail to create tz_map soft link in class\n");
+		}
+	}
+	mutex_unlock(&tz_softlink_lock);
+
+	result = sysfs_create_link(tz_softlink_kobj,
+				&tz->device.kobj, tz->type);
+	if (result)
+		dev_err(&tz->device, "Fail to create tz_map soft link\n");
 
 	return tz;
 
@@ -2703,11 +2768,14 @@ static ssize_t
 thermal_sconfig_store(struct device *dev,
 				      struct device_attribute *attr, const char *buf, size_t len)
 {
+	int rv;
 	int val = -1;
 
-	val = simple_strtol(buf, NULL, 10);
-
+	rv = kstrtoint(buf, 10, &val);
 	atomic_set(&switch_mode, val);
+
+	if (rv)
+		return rv;
 
 	return len;
 }
@@ -2716,23 +2784,24 @@ static DEVICE_ATTR(sconfig, 0664,
 		   thermal_sconfig_show, thermal_sconfig_store);
 
 static ssize_t
-thermal_boost_show(struct device *dev,
+boost_show(struct device *dev,
 				      struct device_attribute *attr, char *buf)
 {
 	return snprintf(buf, PAGE_SIZE, boost_buf);
 }
 
 static ssize_t
-thermal_boost_store(struct device *dev,
+boost_store(struct device *dev,
 				      struct device_attribute *attr, const char *buf, size_t len)
 {
 	int ret;
-	ret = snprintf(boost_buf, PAGE_SIZE, buf);
+
+	ret = snprintf(boost_buf, sizeof(boost_buf), buf);
 	return len;
 }
 
 static DEVICE_ATTR(boost, 0644,
-		   thermal_boost_show, thermal_boost_store);
+		   boost_show, boost_store);
 
 static ssize_t
 thermal_temp_state_show(struct device *dev,
@@ -2745,11 +2814,14 @@ static ssize_t
 thermal_temp_state_store(struct device *dev,
 				      struct device_attribute *attr, const char *buf, size_t len)
 {
+	int rv;
 	int val = -1;
 
-	val = simple_strtol(buf, NULL, 10);
-
+	rv = kstrtoint(buf, 10, &val);
 	atomic_set(&temp_state, val);
+
+	if (rv)
+		return rv;
 
 	return len;
 }
